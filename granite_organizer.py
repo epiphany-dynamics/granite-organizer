@@ -17,6 +17,9 @@ import openpyxl
 
 MH_PATTERN = re.compile(r"(\d{3}-\d{2}-\d{3})")
 SEGMENT_PATTERN = re.compile(r"^[A-Z]-\d+$")
+LATERAL_TAP_PATTERN = re.compile(
+    r"\d{3}-\d{2}-\d{3}\s*-\s*(?:SMH-)?\d{3}-\d{2}-\d{3}\s*-\s*(\d+)"
+)
 PDF_EXTENSIONS = {".pdf"}
 CONFIG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(sys.argv[0])), "organizer_config.json"
@@ -40,47 +43,72 @@ def save_config(data):
 
 
 def build_lookup(excel_path):
-    """Scan all sheets for rows with a segment ID and at least 2 manhole IDs.
-    Returns (lookup_dict, set_of_segment_ids)."""
+    """Scan all sheets for mainline rows (segment ID + 2 MH IDs) and lateral
+    rows (2 MH IDs + tap number, no segment ID).
+    Returns (mainline_lookup, lateral_lookup, segments, lateral_count)."""
     wb = openpyxl.load_workbook(excel_path, data_only=True)
-    lookup = {}
+    mainline = {}
+    laterals = {}
     segments = set()
+    lateral_count = 0
 
     for ws in wb.worksheets:
         for row in ws.iter_rows(min_row=1, values_only=True):
             cells = [str(c).strip() if c is not None else "" for c in row]
             segment_id = None
             mh_ids = []
+            small_ints = []
 
             for cell in cells:
                 if not segment_id and SEGMENT_PATTERN.match(cell):
                     segment_id = cell
                 mh_ids.extend(MH_PATTERN.findall(cell))
+                if re.fullmatch(r"\d{1,4}", cell) and not MH_PATTERN.search(cell):
+                    small_ints.append(cell)
 
-            if segment_id and len(mh_ids) >= 2:
-                unique = list(dict.fromkeys(mh_ids))
-                if len(unique) >= 2:
-                    lookup[(unique[0], unique[1])] = segment_id
-                    lookup[(unique[1], unique[0])] = segment_id
-                    segments.add(segment_id)
+            unique_mh = list(dict.fromkeys(mh_ids))
+
+            if segment_id and len(unique_mh) >= 2:
+                mainline[(unique_mh[0], unique_mh[1])] = segment_id
+                mainline[(unique_mh[1], unique_mh[0])] = segment_id
+                segments.add(segment_id)
+            elif len(unique_mh) >= 2 and small_ints:
+                tap = small_ints[0]
+                key1 = (unique_mh[0], unique_mh[1], tap)
+                key2 = (unique_mh[1], unique_mh[0], tap)
+                laterals[key1] = tap
+                laterals[key2] = tap
+                lateral_count += 1
 
     wb.close()
-    return lookup, segments
+    return mainline, laterals, segments, lateral_count
 
 
-def match_file(filename, lookup):
-    """Try to match a filename to a segment via its manhole IDs."""
+def match_file(filename, mainline_lookup, lateral_lookup):
+    """Match a filename to a segment. Returns (segment, tap_number, mh_ids).
+    tap_number is set when the file is a lateral inspection."""
     mh_ids = MH_PATTERN.findall(filename)
     if len(mh_ids) < 2:
-        return None, mh_ids
+        return None, None, mh_ids
+
+    tap_match = LATERAL_TAP_PATTERN.search(filename)
+    tap = tap_match.group(1) if tap_match else None
+
     for i in range(len(mh_ids)):
         for j in range(i + 1, len(mh_ids)):
-            seg = lookup.get((mh_ids[i], mh_ids[j])) or lookup.get(
+            seg = mainline_lookup.get((mh_ids[i], mh_ids[j])) or mainline_lookup.get(
                 (mh_ids[j], mh_ids[i])
             )
             if seg:
-                return seg, mh_ids
-    return None, mh_ids
+                if tap and lateral_lookup:
+                    if (mh_ids[i], mh_ids[j], tap) not in lateral_lookup and (
+                        mh_ids[j],
+                        mh_ids[i],
+                        tap,
+                    ) not in lateral_lookup:
+                        pass
+                return seg, tap, mh_ids
+    return None, tap, mh_ids
 
 
 def organize_files(excel_path, pdf_folder, video_folder, output_folder, move, log):
@@ -90,15 +118,16 @@ def organize_files(excel_path, pdf_folder, video_folder, output_folder, move, lo
 
     log(f"\nReading: {os.path.basename(excel_path)}")
     try:
-        lookup, segments = build_lookup(excel_path)
+        mainline_lookup, lateral_lookup, segments, lateral_count = build_lookup(excel_path)
     except Exception as e:
         log(f"ERROR reading spreadsheet: {e}")
         return
-    log(f"Found {len(segments)} segments with MH mappings\n")
+    log(f"Found {len(segments)} mainline segments and {lateral_count} laterals\n")
 
     action_word = "Moving" if move else "Copying"
     file_op = shutil.move if move else shutil.copy2
     matched = 0
+    matched_laterals = 0
     unmatched = []
 
     sources = []
@@ -120,9 +149,14 @@ def organize_files(excel_path, pdf_folder, video_folder, output_folder, move, lo
 
         log(f"--- {label}s: {len(files)} files in {folder} ---")
         for idx, filename in enumerate(files, 1):
-            seg, mh_ids = match_file(filename, lookup)
+            seg, tap, mh_ids = match_file(filename, mainline_lookup, lateral_lookup)
             if seg:
-                dest_dir = os.path.join(output_folder, seg)
+                if tap:
+                    dest_dir = os.path.join(output_folder, seg, f"Lat-{tap}")
+                    label_path = f"{seg}/Lat-{tap}/"
+                else:
+                    dest_dir = os.path.join(output_folder, seg)
+                    label_path = f"{seg}/"
                 os.makedirs(dest_dir, exist_ok=True)
                 dest = os.path.join(dest_dir, filename)
                 if os.path.exists(dest):
@@ -133,18 +167,22 @@ def organize_files(excel_path, pdf_folder, video_folder, output_folder, move, lo
                         n += 1
                 try:
                     file_op(os.path.join(folder, filename), dest)
-                    log(f"  {idx}/{len(files)}  {seg}/  <-  {filename}")
+                    log(f"  {idx}/{len(files)}  {label_path}  <-  {filename}")
                     matched += 1
+                    if tap:
+                        matched_laterals += 1
                 except Exception as e:
                     log(f"  ERROR on {filename}: {e}")
             else:
                 reason = f"MH IDs {mh_ids}" if mh_ids else "no MH IDs found"
+                if tap:
+                    reason += f" (lateral tap {tap}, no parent segment)"
                 unmatched.append((label, filename, reason))
                 log(f"  {idx}/{len(files)}  NO MATCH  {filename}  ({reason})")
         log("")
 
     log("=" * 55)
-    log(f"  DONE  —  {matched} files organized, {len(unmatched)} unmatched")
+    log(f"  DONE  —  {matched} files organized ({matched_laterals} laterals), {len(unmatched)} unmatched")
     log("=" * 55)
     if unmatched:
         log("\nUnmatched files:")
